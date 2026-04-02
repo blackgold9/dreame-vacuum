@@ -17,9 +17,17 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.components.vacuum import (
     StateVacuumEntity,
     VacuumEntityFeature,
-    Segment as VacuumSegment,
     ENTITY_ID_FORMAT,
 )
+
+try:
+    from homeassistant.components.vacuum import Segment as VacuumSegment
+    # Segment and CLEAN_AREA were added in the same HA release (2026.4);
+    # the hasattr check is defensive in case a future release decouples them.
+    _HAS_CLEAN_AREA = hasattr(VacuumEntityFeature, "CLEAN_AREA")
+except ImportError:
+    VacuumSegment = None
+    _HAS_CLEAN_AREA = False
 from .recorder import VACUUM_UNRECORDED_ATTRIBUTES
 
 from .dreame.const import (
@@ -1027,7 +1035,7 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
         )
         self._activity_class = activity_class
 
-        if self.device.capability.lidar_navigation:
+        if _HAS_CLEAN_AREA and self.device.capability.lidar_navigation:
             self._attr_supported_features |= VacuumEntityFeature.CLEAN_AREA
 
         self._set_attrs()
@@ -1035,19 +1043,25 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         self._set_attrs()
-        self._check_segments_changed()
+        if _HAS_CLEAN_AREA:
+            self._check_segments_changed()
         self.async_write_ha_state()
 
     @callback
     def _check_segments_changed(self) -> None:
         """Create a repair issue if segments have changed since area mapping was configured."""
-        last_seen = self.last_seen_segments
+        current_segments = self.device.status.current_segments
+        if not current_segments:
+            return
+        last_seen = getattr(self, "last_seen_segments", None)
         if last_seen is None:
             return
-        current_ids = {str(seg_id) for seg_id in (self.device.status.current_segments or {})}
+        current_ids = {str(seg_id) for seg_id in current_segments}
         last_seen_ids = {seg.id for seg in last_seen}
         if current_ids != last_seen_ids:
-            self.async_create_segments_issue()
+            create = getattr(self, "async_create_segments_issue", None)
+            if create:
+                create()
 
     def _set_attrs(self):
         if self.device.status.has_error:
@@ -1145,8 +1159,10 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
         """Set the vacuum cleaner to return to the dock."""
         await self._try_command("Unable to call return_to_base: %s", self.device.return_to_base)
 
-    async def async_get_segments(self) -> list[VacuumSegment]:
+    async def async_get_segments(self) -> list:
         """Return the segments (rooms) available for cleaning."""
+        if VacuumSegment is None:
+            return []
         segments = self.device.status.current_segments
         if not segments:
             return []
@@ -1159,10 +1175,14 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
 
     async def async_clean_segments(self, segment_ids: list[str], **kwargs) -> None:
         """Clean the specified segments (HA CLEAN_AREA interface)."""
+        try:
+            int_ids = [int(sid) for sid in segment_ids]
+        except (ValueError, TypeError) as exc:
+            raise HomeAssistantError(f"Invalid segment ID in {segment_ids}: {exc}") from exc
         await self._try_command(
             "Unable to call clean_segment: %s",
             self.device.clean_segment,
-            [int(sid) for sid in segment_ids],
+            int_ids,
         )
 
     async def async_clean_zone(self, zone, repeats=1, suction_level="", water_volume="") -> None:
